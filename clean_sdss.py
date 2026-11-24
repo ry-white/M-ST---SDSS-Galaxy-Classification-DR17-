@@ -1,15 +1,21 @@
 """
-Clean the Kaggle SDSS DR17 'star_classification.csv' for galaxy / star / QSO work.
+Clean the Kaggle SDSS DR17 'star_classification.csv' into a galaxy sample for
+red / green-valley / blue classification in the u-r vs M_r plane.
 
-The file has NO magnitude errors, NO photometric flags and NO zWarning, so the
-S/N cut here is a *proxy* built from the SDSS asinh-magnitude softening
-parameters. For a publication-grade cut, pull the real columns from CasJobs
-(see the SQL at the bottom of this file) and swap them in.
+Uses ONLY the Kaggle columns. Consequences (state these in the write-up):
+  * S/N is a proxy from the SDSS asinh-magnitude softening parameters, not
+    real magnitude errors.
+  * No Galactic-extinction correction (no dust map / extinction column).
+  * No k-correction here; M_r is distance modulus only. The redshift
+    dependence of colours is absorbed later, in the labelling model.
+
+Default sample: GALAXY, 0.02 < z < 0.15, r <= 17.77 (SDSS Legacy main-galaxy
+limit), proxy S/N >= 5 in u, g, r.
 
 Examples
 --------
-    python clean_sdss.py star_classification.csv cleaned.parquet
-    python clean_sdss.py star_classification.csv cleaned.csv --sn-min 10 --bands gri
+    python clean_sdss.py star_classification.csv galaxies.parquet
+    python clean_sdss.py star_classification.csv galaxies.parquet --zmax 0.1
     python clean_sdss.py star_classification.csv features.parquet --ml-features
 """
 import argparse
@@ -18,6 +24,7 @@ import numpy as np
 import pandas as pd
 from astropy import units as u
 from astropy.coordinates import SkyCoord, search_around_sky
+from astropy.cosmology import FlatLambdaCDM
 
 # ---------------------------------------------------------------- constants
 BANDS = list("ugriz")
@@ -27,19 +34,11 @@ BANDS = list("ugriz")
 M0 = {"u": 24.63, "g": 25.11, "r": 24.80, "i": 24.36, "z": 22.83}
 POGSON_A = 2.5 / np.log(10)                     # a = 1.0857
 
-# Sane redshift window for each spectroscopic class: columns = lo, hi
-Z_LIMITS = pd.DataFrame(
-    {"STAR": (-0.005, 0.005),                   # |v| < 1500 km/s
-     "GALAXY": (0.002, 1.2),                    # z~0 "galaxies" = bad fits
-     "QSO": (0.05, 7.5)},
-    index=["lo", "hi"],
-).T
+# A cosmology is a model choice, not external data. State it in the write-up.
+COSMO = FlatLambdaCDM(H0=70, Om0=0.3)
 
-# Survey bookkeeping: identifies *how* an object was observed, not *what* it
-# is. Leaks targeting information into a classifier, so never use as features.
-BOOKKEEPING = ["obj_ID", "run_ID", "rerun_ID", "cam_col", "field_ID",
-               "spec_obj_ID", "plate", "MJD", "fiber_ID"]
-COLOURS = ["u-g", "g-r", "r-i", "i-z"]
+ID_COLS = ["plate", "MJD", "fiber_ID"]           # unique key; never a feature
+COLOURS = ["u-g", "g-r", "r-i", "i-z", "u-r"]
 
 
 # ---------------------------------------------------------------- helpers
@@ -58,47 +57,46 @@ def proxy_sn(mag, band):
 
 
 def add_sn_columns(df):
-    """Attach sn_<band> proxy columns for every band (used by cuts + dedup)."""
+    """Attach sn_<band> proxy columns for every band."""
     df = df.copy()
     for b in BANDS:
         valid = df[b].where(df[b].between(0, 35))     # -9999 etc. -> NaN
-        df[f"sn_{b}"] = proxy_sn(valid, b)            # NaN >= x is False, so NaN fails cuts
+        df[f"sn_{b}"] = proxy_sn(valid, b)            # NaN fails every >= cut
     return df
 
 
-def add_colours(df):
+def add_derived(df):
+    """Colours and absolute magnitude M_r = r - DM(z) (no k-correction)."""
     df = df.copy()
     for c in COLOURS:
         a, b = c.split("-")
         df[c] = df[a] - df[b]
+    df["M_r"] = df["r"] - COSMO.distmod(df["redshift"].to_numpy()).value
     return df
 
 
 # ---------------------------------------------------------------- cuts
-def quality_cuts(df, sn_min, sn_bands):
+def quality_cuts(df, args):
     """
-    Row-wise quality cuts. Returns {name: boolean Series aligned on df.index};
-    True = row passes. All masks are pandas Series so they align by index.
+    Row-wise cuts, applied in the order listed (matters only for the cut-flow
+    printout). Returns {name: boolean Series aligned on df.index}.
     """
-    unknown = set(df["class"].unique()) - set(Z_LIMITS.index)
-    if unknown:
-        raise ValueError(f"No redshift window defined for class(es): {unknown}")
-
-    lims = Z_LIMITS.loc[df["class"]].set_index(df.index)   # per-row lo/hi
-
+    sn_cols = [f"sn_{b}" for b in args.bands]
     return {
+        "class == GALAXY": df["class"].eq("GALAXY"),
         "valid mags": df[BANDS].gt(0).all(axis=1) & df[BANDS].lt(35).all(axis=1),
-        f"S/N>={sn_min:g} in {''.join(sn_bands)}":
-            df[[f"sn_{b}" for b in sn_bands]].ge(sn_min).all(axis=1),
-        "redshift vs class": df["redshift"].between(lims["lo"], lims["hi"]),
+        f"{args.zmin:g} < z < {args.zmax:g}":
+            df["redshift"].gt(args.zmin) & df["redshift"].lt(args.zmax),
+        f"r <= {args.rmax:g}": df["r"].le(args.rmax),
+        f"S/N>={args.sn_min:g} in {''.join(args.bands)}":
+            df[sn_cols].ge(args.sn_min).all(axis=1),
     }
 
 
 def duplicate_mask(df, radius_arcsec, rank_col):
     """
     Sky crossmatch of the catalogue against itself. Within each matched pair,
-    keep the row with the higher `rank_col` (e.g. r-band S/N).
-    Returns a boolean Series, True = keep.
+    keep the row with the higher `rank_col`. Returns boolean Series, True = keep.
     """
     coords = SkyCoord(df["alpha"].to_numpy() * u.deg, df["delta"].to_numpy() * u.deg)
     i, j, _, _ = search_around_sky(coords, coords, radius_arcsec * u.arcsec)
@@ -119,12 +117,11 @@ def duplicate_mask(df, radius_arcsec, rank_col):
 def print_cutflow(df, steps):
     """steps: list of (name, boolean Series). Applied cumulatively."""
     keep = pd.Series(True, index=df.index)
-    print(f"{'cut':30s}{'N left':>9s}   per class")
-    print(f"{'start':30s}{len(df):9d}   {df['class'].value_counts().to_dict()}")
+    print(f"{'cut':30s}{'N left':>9s}")
+    print(f"{'start':30s}{len(df):9d}")
     for name, mask in steps:
         keep &= mask.reindex(df.index, fill_value=False)
-        per = df.loc[keep, "class"].value_counts().to_dict()
-        print(f"{name:30s}{keep.sum():9d}   {per}")
+        print(f"{name:30s}{keep.sum():9d}")
     return keep
 
 
@@ -133,72 +130,53 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="star_classification.csv")
     p.add_argument("output", help="output file; .parquet or .csv")
+    p.add_argument("--zmin", type=float, default=0.02,
+                   help="min redshift; below ~0.02 peculiar velocities bias distances (default 0.02)")
+    p.add_argument("--zmax", type=float, default=0.15, help="max redshift (default 0.15)")
+    p.add_argument("--rmax", type=float, default=17.77,
+                   help="faint r limit; 17.77 = SDSS main-galaxy limit (default)")
     p.add_argument("--sn-min", type=float, default=5.0, help="min proxy S/N (default 5)")
-    p.add_argument("--bands", default="gri", help="bands the S/N cut applies to (default gri)")
+    p.add_argument("--bands", default="ugr", help="bands the S/N cut applies to (default ugr)")
     p.add_argument("--dedup-arcsec", type=float, default=1.0,
                    help="crossmatch radius for duplicates (default 1 arcsec)")
     p.add_argument("--ml-features", action="store_true",
-                   help="write only class + colours + r (+ redshift) for ML")
-    return p.parse_args()
+                   help="write only IDs + redshift + r + M_r + colours")
+    args = p.parse_args()
+
+    args.bands = list(args.bands)
+    if bad := set(args.bands) - set(BANDS):
+        p.error(f"unknown band(s) in --bands: {bad}")
+    if not args.zmin < args.zmax:
+        p.error("--zmin must be < --zmax")
+    return args
 
 
 def main():
     args = parse_args()
-    sn_bands = list(args.bands)
-    if bad := set(sn_bands) - set(BANDS):
-        raise SystemExit(f"Unknown band(s) in --bands: {bad}")
-
     df = add_sn_columns(load(args.input))
 
     # 1) row-wise quality cuts
-    cuts = quality_cuts(df, args.sn_min, sn_bands)
+    cuts = quality_cuts(df, args)
     passed = pd.Series(True, index=df.index)
     for m in cuts.values():
         passed &= m
 
-    # 2) dedup ONLY among rows that passed, so a good copy is never lost
-    #    because its twin failed a cut
-    survivors = df[passed]
-    dedup = duplicate_mask(survivors, args.dedup_arcsec, rank_col="sn_r")
+    # 2) dedup ONLY among rows that passed, keeping the higher r-band S/N copy
+    dedup = duplicate_mask(df[passed], args.dedup_arcsec, rank_col="sn_r")
 
     steps = list(cuts.items()) + [(f"unique (<{args.dedup_arcsec:g}\" match)", dedup)]
     keep = print_cutflow(df, steps)
 
-    clean = add_colours(df[keep])
+    clean = add_derived(df[keep])
     if args.ml_features:
-        clean = clean[["class"] + COLOURS + ["r", "redshift"]]
+        clean = clean[ID_COLS + ["redshift", "r", "M_r"] + COLOURS]
 
     if args.output.endswith(".parquet"):
         clean.to_parquet(args.output, index=False)
     else:
         clean.to_csv(args.output, index=False)
-    print(f"\nwrote {len(clean)} rows -> {args.output}")
-    if args.ml_features:
-        print("note: 'redshift' is included but is near-label leakage; "
-              "drop it for photometry-only classification.")
+    print(f"\nwrote {len(clean)} galaxies -> {args.output}")
 
 
 if __name__ == "__main__":
     main()
-
-
-# ---------------------------------------------------------------------------
-# To get REAL quality columns: upload plate, MJD, fiber_ID to CasJobs MyDB
-# (e.g. as table 'kag') and run against DR17:
-#
-# SELECT k.plate, k.MJD, k.fiber_ID,
-#        s.zWarning, s.zErr, s.snMedian_r, s.subClass,
-#        p.type, p.clean,
-#        p.modelMagErr_u, p.modelMagErr_g, p.modelMagErr_r,
-#        p.modelMagErr_i, p.modelMagErr_z,
-#        p.extinction_u, p.extinction_g, p.extinction_r,
-#        p.extinction_i, p.extinction_z,
-#        p.petroMag_r, p.petroR50_r, p.fracDeV_r
-# INTO mydb.kag_quality
-# FROM mydb.kag AS k
-# JOIN SpecObj  AS s ON s.plate = k.plate AND s.mjd = k.MJD AND s.fiberID = k.fiber_ID
-# JOIN PhotoObj AS p ON p.objID = s.bestObjID
-#
-# Then cut: zWarning = 0, clean = 1, modelMagErr < 0.2 (S/N>~5),
-# and subtract extinction_* from the magnitudes before forming colours.
-# ---------------------------------------------------------------------------
